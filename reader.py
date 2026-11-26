@@ -16,6 +16,7 @@ from __future__ import annotations  # permite "str | re.Pattern" etc. em Python 
 
 import platform
 import re
+import unicodedata
 from typing import List, Optional
 
 import streamlit as st
@@ -88,6 +89,163 @@ LABELS_TXT = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Extração de NOME, CPF, CARGO e COMPETÊNCIA (vários formatos de holerite)
+# ---------------------------------------------------------------------------
+_MAI = "A-ZÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇÑ"
+_MIN = "a-záàâãäéèêëíìîïóòôõöúùûüçñ"
+_PALAVRA = rf"[{_MAI}][{_MAI}{_MIN}'.\-]+"
+# 2+ palavras iniciadas por maiúscula (aceita "JOÃO DA SILVA" e "João da Silva")
+NOME_RE = re.compile(rf"{_PALAVRA}(?:\s+(?:(?:d[aeo]s?|e|di|du|del|van|von)\s+)?{_PALAVRA})+")
+CORTE_NOME_RE = re.compile(
+    r"\s+(?:cpf\b|cargo\b|fun[cç][aã]o\b|ref\.?(?=[\s:]|$)|refer[eê]ncia\b|compet[eê]ncia\b|"
+    r"cbo\b|admiss[aã]o\b|depart\w*|matr[ií]cula\b|c[oó]digo\b|sal[aá]rio\b)",
+    re.I,
+)
+EMPRESA_RE = re.compile(
+    r"\b(?:ltda|s\.?\s?a\.?|eireli|cnpj|empresa|com[eé]rcio|ind[uú]stria|servi[cç]os|"
+    r"associa[cç][aã]o|funda[cç][aã]o|cooperativa)\b", re.I)
+EVITA_RE = re.compile(
+    r"cargo|fun[cç][aã]o|compet[eê]ncia|admiss|depart|\bref\b|\brg\b|\bpis\b|ctps|"
+    r"recibo|demonstrativo|pagamento|holerite|folha", re.I)
+
+TITULO_RE = re.compile(r"recibo|demonstrativo|pagamento|holerite|folha|declara", re.I)
+
+_ROT_NOME = (
+    r"nome(?!\s+d[aeo]s?\s+(?:m[aã]e|pai|banco|empresa|fantasia|social|dependente))"
+    r"(?:\s+d[aeo]s?\s+(?:funcion[aá]ri[oa]|colaborador(?:a)?|empregad[oa]|trabalhador(?:a)?|servidor(?:a)?))?"
+    r"|funcion[aá]ri[oa](?:\(a\))?|colaborador(?:\(a\)|a)?|empregad[oa]|trabalhador(?:a)?"
+    r"|servidor(?:a)?|benefici[aá]ri[oa]"
+)
+ROTULO_NOME_RE = re.compile(rf"\b(?:{_ROT_NOME})(?!\w)", re.I)
+SEP_RE = re.compile(r"^(?:[\s.]*[:\-–][\s.]*|\s*\.{3,}\s*)")  # ":"  "-"  "......"
+
+CPF_ROTULO_RE = re.compile(r"cpf\b[^\d]{0,25}?(\d{3}\.?\d{3}\.?\d{3}-?\d{2})(?!\d)", re.I)
+CPF_PONTUADO_RE = re.compile(r"(?<![\d./-])\d{3}\.\d{3}\.\d{3}-\d{2}(?![\d/])")
+
+ROTULO_CARGO_RE = re.compile(r"\b(?:cargo|fun[cç][aã]o|ocupa[cç][aã]o)(?!\w)", re.I)
+CORTE_CARGO_RE = re.compile(
+    r"\s+(?:cpf\b|ref\.?(?=[\s:]|$)|compet[eê]ncia\b|cbo\b|admiss[aã]o\b|depart\w*|"
+    r"matr[ií]cula\b|sal[aá]rio\b)|\s{2,}", re.I)
+
+_MESES = {"janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
+          "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12}
+COMP_ROTULO_RE = re.compile(
+    r"(?:compet[eê]ncia|refer[eê]ncia|ref\.|m[eê]s\s*/\s*ano|per[ií]odo)\W{0,15}?"
+    r"(0?[1-9]|1[0-2])\s*/\s*(\d{4})", re.I)
+COMP_SOLTA_RE = re.compile(r"(?<![\d/])(0[1-9]|1[0-2])/((?:19|20)\d{2})(?!\d)")
+COMP_MES_RE = re.compile(r"\b(" + "|".join(_MESES) + r")\s*(?:/|de|-)?\s*((?:19|20)\d{2})\b", re.I)
+
+
+def limpar_nome(s: str) -> str:
+    s = CORTE_NOME_RE.split(s, maxsplit=1)[0]
+    s = re.sub(r"\s{2,}.*$", "", s)  # 2+ espaços normalmente separam colunas
+    return s.strip(" .:-–\t")
+
+
+def achar_cpf(texto: str):
+    """Devolve (cpf formatado, posição no texto). Aceita 'CPF: 12345678909' sem pontuação."""
+    m = CPF_ROTULO_RE.search(texto)
+    if m:
+        ini, bruto = m.start(1), m.group(1)
+    else:
+        m = CPF_PONTUADO_RE.search(texto)
+        if not m:
+            return "", -1
+        ini, bruto = m.start(), m.group(0)
+    d = re.sub(r"\D", "", bruto)
+    return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}", ini
+
+
+def extrair_nome(texto: str, linhas: list, pos_cpf: int) -> str:
+    # a) "Rótulo: valor" na mesma linha (Nome:, Funcionário -, Colaborador(a) ....:)
+    for ln in linhas:
+        for m in ROTULO_NOME_RE.finditer(ln):
+            resto = ln[m.end():]
+            sep = SEP_RE.match(resto)
+            if not sep:
+                continue
+            cand = NOME_RE.match(resto[sep.end():].lstrip())
+            if cand:
+                nome = limpar_nome(cand.group(0))
+                if nome and not EMPRESA_RE.search(nome):
+                    return nome
+
+    # b) rótulo em uma linha (cabeçalho de tabela) e o valor na linha de baixo
+    for i, ln in enumerate(linhas[:-1]):
+        if ":" in ln or TITULO_RE.search(ln) or not ROTULO_NOME_RE.search(ln):
+            continue
+        for prox in linhas[i + 1:i + 3]:
+            if not prox.strip() or ROTULO_NOME_RE.search(prox):
+                continue
+            cand = NOME_RE.search(prox)
+            if cand:
+                nome = limpar_nome(cand.group(0))
+                if nome and not EMPRESA_RE.search(nome):
+                    return nome
+            break
+
+    # c) nome escrito logo antes do CPF (mesma linha ou linhas anteriores)
+    if pos_cpf >= 0:
+        ini_linha = texto.rfind("\n", 0, pos_cpf) + 1
+        segmentos = [re.sub(r"(?i)cpf\b[\s:.\-]*$", "", texto[ini_linha:pos_cpf])]
+        fim = ini_linha - 1
+        for _ in range(3):
+            if fim <= 0:
+                break
+            ini = texto.rfind("\n", 0, fim) + 1
+            segmentos.append(texto[ini:fim])
+            fim = ini - 1
+        for seg in segmentos:
+            if not seg.strip() or EMPRESA_RE.search(seg) or EVITA_RE.search(seg):
+                continue
+            achados = list(NOME_RE.finditer(seg))
+            if achados:
+                nome = limpar_nome(achados[0].group(0))
+                if nome:
+                    return nome
+    return ""
+
+
+def extrair_cargo(linhas: list) -> str:
+    for ln in linhas:
+        for m in ROTULO_CARGO_RE.finditer(ln):
+            resto = ln[m.end():]
+            sep = SEP_RE.match(resto)
+            if not sep:
+                continue
+            valor = CORTE_CARGO_RE.split(resto[sep.end():].strip(), maxsplit=1)[0].strip(" .:-–")
+            if valor and re.search(r"[A-Za-zÀ-ÿ]", valor):
+                return valor
+    return ""
+
+
+def _sem_acento(s: str) -> str:
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+
+
+def extrair_competencia(texto: str) -> str:
+    m = COMP_ROTULO_RE.search(texto)
+    if m:
+        return f"{int(m.group(1)):02d}/{m.group(2)}"
+    m = COMP_MES_RE.search(_sem_acento(texto))
+    if m:
+        return f"{_MESES[m.group(1).lower()]:02d}/{m.group(2)}"
+    m = COMP_SOLTA_RE.search(texto)  # ignora datas completas tipo 05/01/2020
+    return f"{m.group(1)}/{m.group(2)}" if m else ""
+
+
+def cpf_valido(cpf: str) -> bool:
+    d = [int(x) for x in re.sub(r"\D", "", cpf or "")]
+    if len(d) != 11 or len(set(d)) == 1:
+        return False
+    for n in (9, 10):
+        s = sum(v * w for v, w in zip(d[:n], range(n + 1, 1, -1)))
+        if (s * 10 % 11) % 10 != d[n]:
+            return False
+    return True
+
+
 class HoleriteAuditado(BaseModel):
     arquivo: str
     pagina: int
@@ -103,6 +261,7 @@ class HoleriteAuditado(BaseModel):
     salario_liquido: float = Field(default=0.0, ge=0.0)
     divergencia: bool = False
     diferenca: float = 0.0
+    alertas: str = ""
 
     @model_validator(mode="after")
     def conferir_totais(self):
@@ -110,6 +269,21 @@ class HoleriteAuditado(BaseModel):
         self.diferenca = round(self.salario_liquido - esperado, 2)
         # Bruto zerado = documento não lido: também deve ser sinalizado para revisão.
         self.divergencia = abs(self.diferenca) > TOLERANCIA or self.salario_bruto == 0
+
+        alertas = []
+        if not self.nome:
+            alertas.append("nome não encontrado")
+        if not self.cpf:
+            alertas.append("CPF não encontrado")
+        elif not cpf_valido(self.cpf):
+            alertas.append("CPF com dígito verificador inválido (conferir leitura)")
+        if not self.competencia:
+            alertas.append("competência não encontrada")
+        if self.salario_bruto == 0:
+            alertas.append("valores não lidos (bruto zerado)")
+        elif self.divergencia:
+            alertas.append("bruto − descontos ≠ líquido")
+        self.alertas = "; ".join(alertas)
         return self
 
 
@@ -184,14 +358,16 @@ def interpretar_local(arquivo: str, pagina: int, texto: str) -> HoleriteAuditado
             2,
         )
 
-    for campo, padrao in LABELS_TXT.items():
-        m = re.search(padrao, texto, re.I)
-        dados[campo] = m.group(1).strip() if m else ""
+    dados["cpf"], pos_cpf = achar_cpf(texto)
+    dados["nome"] = extrair_nome(texto, linhas, pos_cpf)
+    dados["cargo"] = extrair_cargo(linhas)
+    dados["competencia"] = extrair_competencia(texto)
 
-    if not dados["nome"] and dados["cpf"]:
-        m_nome = NOME_ANTES_CPF_RE.search(texto)
-        if m_nome:
-            dados["nome"] = m_nome.group(1).strip()
+    # Rede de segurança: padrões antigos (LABELS_TXT) só para o que ficou vazio
+    for campo in ("nome", "cargo"):
+        if not dados[campo]:
+            m = re.search(LABELS_TXT[campo], texto, re.I)
+            dados[campo] = limpar_nome(m.group(1)) if (m and campo == "nome") else (m.group(1).strip() if m else "")
 
     return HoleriteAuditado(**dados)
 
@@ -211,6 +387,12 @@ def mostrar_tabela(d: "pd.DataFrame"):
 def responder(pergunta: str, d: "pd.DataFrame") -> str:
     """Respostas por regras sobre a tabela (não usa modelo de IA)."""
     p = pergunta.lower()
+    if any(k in p for k in ("alerta", "revis", "faltan", "sem nome", "sem cpf", "não encontr", "nao encontr")):
+        com = d[d["alertas"] != ""]
+        if com.empty:
+            return "Nenhum alerta: nome, CPF, competência e totais foram lidos em todas as folhas."
+        return "Folhas para revisar:\n" + "\n".join(
+            f"- {r.nome or r.arquivo} (pág. {r.pagina}): {r.alertas}" for r in com.itertuples())
     if "diverg" in p:
         divs = d[d["divergencia"]]
         if divs.empty:
@@ -317,10 +499,17 @@ if df is not None and not df.empty:
     except Exception as e:
         st.caption(f"Gráfico indisponível: {e}")
 
-    csv_bytes = saida.drop(columns=["divergencia", "diferenca"]).to_csv(
+    csv_bytes = saida.drop(columns=["divergencia", "diferenca", "alertas"]).to_csv(
         index=False, sep=";", decimal=",", encoding="utf-8-sig"
     )
     st.download_button("Baixar CSV (Excel PT-BR)", csv_bytes, file_name="folhas_extraidas.csv", mime="text/csv")
+
+    with st.expander("Texto extraído de cada página (para calibrar nome, CPF e demais campos)"):
+        for nome_dbg, t in st.session_state.get("debug", {}).items():
+            if mascarar:
+                t = re.sub(r"(\d{3})\.(\d{3})\.(\d{3})-(\d{2})", r"•••.•••.•••-\4", t)
+            st.markdown(f"**{nome_dbg}**")
+            st.code(t[:3000] or "(vazio)")
 
     st.divider()
     st.subheader("Consulta rápida do lote (local)")
